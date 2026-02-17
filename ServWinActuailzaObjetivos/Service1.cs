@@ -1,15 +1,16 @@
-﻿using System;
+﻿using ServWinActualizaObj.Services;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.Remoting.Contexts;
 using System.ServiceProcess;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Timers;
-using WindowsServiceTestGeisha.Services;
 
 namespace WindowsServiceTestGeisha
 {
@@ -17,7 +18,7 @@ namespace WindowsServiceTestGeisha
     {
         private CancellationTokenSource _cancellationTokenSource;
         private Task _mainTask;
-        private readonly string _logFile = @"C:\Log\TransferService_" + DateTime.Now.ToString("yyyy_MM_dd") + ".txt";
+        private readonly string _logFile = @"C:\Log\ActualizaObjetivo_" + DateTime.Now.ToString("yyyy_MM_dd") + ".txt";
 
         public Service1()
         {
@@ -37,6 +38,7 @@ namespace WindowsServiceTestGeisha
             {
                 try
                 {
+                    // Ejecuta el procesamiento de TODAS las conexiones
                     await ProcesarTareaPrincipalAsync(token);
                 }
                 catch (OperationCanceledException)
@@ -46,12 +48,12 @@ namespace WindowsServiceTestGeisha
                 }
                 catch (Exception ex)
                 {
-                    FileLogger.Log(_logFile, $"SE PRODUJO UNA EXCEPCIÓN EN EL CICLO PRINCIPAL: {ex.Message}\nStackTrace: {ex.StackTrace}");
+                    FileLogger.Log(_logFile, $"SE PRODUJO UNA EXCEPCIÓN GENERAL: {ex.Message}\nStackTrace: {ex.StackTrace}");
                 }
 
                 try
                 {
-                    // ===== CAMBIO AQUÍ: La espera ahora es de 1 hora =====
+                    // Espera 5 minutos antes de volver a procesar TODAS las conexiones
                     await Task.Delay(TimeSpan.FromMinutes(5), token);
                 }
                 catch (OperationCanceledException)
@@ -63,69 +65,81 @@ namespace WindowsServiceTestGeisha
 
         private async Task ProcesarTareaPrincipalAsync(CancellationToken token)
         {
-            // ================== CAMBIOS AQUÍ ==================
-
-            const string conexion = "Toque";
-            //const string conexion = "Kique";
-            //const string conexion = "Nicui";
-            //const string conexion = "Reque";
-            //const string conexion = "Nivil";
-
             token.ThrowIfCancellationRequested();
-            FileLogger.Log(_logFile, "---- Iniciando ciclo de transferencia...");
+            FileLogger.Log(_logFile, "---- Iniciando ciclo de transferencia (procesará TODAS las conexiones) ----");
 
-            string sourceConnectionString;
-
-            // Asigna la cadena de conexión de origen según el valor de la constante
-            switch (conexion)
+            // 1. Definir todas las conexiones de origen
+            var conexionesDeOrigen = new Dictionary<string, string>
             {
-                case "Toque":
-                    //sourceConnectionString = "Data Source=192.168.89.3; Initial Catalog=Toque;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa;TrustServerCertificate=True;Connection Timeout=90";
-                    sourceConnectionString = "Data Source=toque.geisha.mx; Initial Catalog=Toque;Persist Security Info=False;Pwd=QiZSSnDd4XemHbd;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=ApWeb;TrustServerCertificate=True;Connection Timeout=90";
-                    FileLogger.Log(_logFile, "Usando Conexión 1: Toque");
-                    break;
-                case "Kique":
-                    //sourceConnectionString = "Data Source=192.168.89.3; Initial Catalog=Kique;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa;TrustServerCertificate=True;Connection Timeout=90";
-                    sourceConnectionString = "Data Source=192.168.50.242; Initial Catalog=Kique;Persist Security Info=False;Pwd=QiZSSnDd4XemHbd;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=ApWeb;TrustServerCertificate=True;Connection Timeout=90";
-                    FileLogger.Log(_logFile, "Usando Conexión 2: Kique");
-                    break;
-                case "Nicui":
-                    //sourceConnectionString = "Data Source=192.168.89.3; Initial Catalog=Nicui;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa;TrustServerCertificate=True;Connection Timeout=90";
-                    sourceConnectionString = "Data Source=nicui.geisha.mx; Initial Catalog=Nicui;Persist Security Info=False;Pwd=QiZSSnDd4XemHbd;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=ApWeb;TrustServerCertificate=True";
-                    FileLogger.Log(_logFile, "Usando Conexión 3: Nicui");
-                    break;
-                case "Reque":
-                    //sourceConnectionString = "Data Source=192.168.89.3; Initial Catalog=Reque;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa;TrustServerCertificate=True;Connection Timeout=90";
-                    sourceConnectionString = "Data Source=Reque.geisha.mx; Initial Catalog=reque;Persist Security Info=False;Pwd=QiZSSnDd4XemHbd;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=ApWeb; Encrypt=False";
-                    FileLogger.Log(_logFile, "Usando Conexión 4: Reque");
-                    break;
-                case "Nivil":
-                    //sourceConnectionString = "Data Source=192.168.89.3; Initial Catalog=Nivil;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa; Encrypt=False";
-                    sourceConnectionString = "Data Source=nivil.geisha.mx; Initial Catalog=Nivil;Persist Security Info=False;Pwd=QiZSSnDd4XemHbd;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=ApWeb; Encrypt=False";
-                    FileLogger.Log(_logFile, "Usando Conexión 5: Nivil");
-                    break;
-                default:
-                    FileLogger.Log(_logFile, $"ERROR: El valor de 'conexion' ({conexion}) no es válido. Debe ser entre 1 y 5.");
-                    return;
-            }
+                { "Toque", "Data Source=toque.geisha.mx; Initial Catalog=Toque;Persist Security Info=False;Pwd=QiZSSnDd4XemHbd;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=ApWeb;TrustServerCertificate=True;Connection Timeout=90" },
+                //{ "Toque", "Data Source=192.168.89.3; Initial Catalog=Toque;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa;TrustServerCertificate=True;Connection Timeout=90"},
+                { "Kique", "Data Source=Kique.geisha.mx; Initial Catalog=Kique;Persist Security Info=False;Pwd=QiZSSnDd4XemHbd;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=ApWeb;TrustServerCertificate=True" },
+                //{ "Kique", "Data Source=192.168.89.3; Initial Catalog=Kique;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa;TrustServerCertificate=True;Connection Timeout=90"},
+                //{ "Nicui", "Data Source=nicui.geisha.mx; Initial Catalog=Nicui;Persist Security Info=False;Pwd=QiZSSnDd4XemHbd;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=ApWeb;TrustServerCertificate=True"},
+                { "Nicui", "Data Source=192.168.89.1; Initial Catalog=Nicui;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa;TrustServerCertificate=True;Connection Timeout=90"},
+                //{ "Nicui", "Data Source=192.168.89.3; Initial Catalog=Nicui;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa;TrustServerCertificate=True;Connection Timeout=90"},
+                { "Reque", "Data Source=Reque.geisha.mx; Initial Catalog=reque;Persist Security Info=False;Pwd=QiZSSnDd4XemHbd;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=ApWeb; Encrypt=False"},
+                //{ "Reque", "Data Source=192.168.89.3; Initial Catalog=Reque;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa;TrustServerCertificate=True;Connection Timeout=90"},
+                { "Nivil", "Data Source=nivil.geisha.mx; Initial Catalog=Nivil;Persist Security Info=False;Pwd=QiZSSnDd4XemHbd;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=ApWeb; Encrypt=False" }
+                //{ "Nivil", "Data Source=192.168.89.3; Initial Catalog=Nivil;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa; Encrypt=False"}
+            };
 
-            // La conexión de destino permanece igual
-            //string destinationConnectionString = "Data Source=192.168.89.3; Initial Catalog=GrupoGeisha;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa;TrustServerCertificate=True";
             string destinationConnectionString = "Data Source=web.geisha.mx; Initial Catalog=GrupoGeisha;Persist Security Info=False;Pwd=Geish@;MultipleActiveResultSets=True;Connect Timeout=1000;User ID=sa;TrustServerCertificate=True";
+            //string destinationConnectionString = "Data Source = 192.168.89.3; Initial Catalog = GrupoGeisha2; Persist Security Info = False; Pwd = Geish@; MultipleActiveResultSets = True; Connect Timeout = 1000; User ID = sa; TrustServerCertificate = True";
 
-            var repositorio = new RepositorioPrueba(sourceConnectionString, destinationConnectionString);
-
-            int registrosProcesados = await repositorio.ProcesarTransferenciaObjetivosAsync(token);
-
-            if (registrosProcesados > 0)
+            // 3. Iterar sobre cada conexión de origen
+            foreach (var entry in conexionesDeOrigen)
             {
-                FileLogger.Log(_logFile, $"Transferencia completada. Se procesaron {registrosProcesados} registros.");
+                string nombreConexion = entry.Key;
+                string sourceConnectionString = entry.Value;
+
+                // Verificar si se solicitó cancelar antes de procesar la siguiente conexión
+                if (token.IsCancellationRequested)
+                {
+                    FileLogger.Log(_logFile, "Se solicitó cancelación a mitad del ciclo. Deteniendo.");
+                    break;
+                }
+
+                try
+                {
+                    FileLogger.Log(_logFile, $"-----> Procesando Conexión: {nombreConexion}");
+
+                    // 5. Instanciar el repositorio y procesar
+                    var repositorio = new RepositorioObjetivos(sourceConnectionString, destinationConnectionString, _logFile);
+                    int registrosProcesados = await repositorio.ProcesarTransferenciaObjetivosAsync(token);
+
+                    // 6. Registrar el resultado para esta conexión específica
+                    if (registrosProcesados > 0)
+                    {
+                        FileLogger.Log(_logFile, $"<----- Transferencia completada para {nombreConexion}. Se procesaron {registrosProcesados} registros.");
+                    }
+                    else
+                    {
+                        FileLogger.Log(_logFile, $"<----- No se encontraron registros nuevos para {nombreConexion}.");
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    FileLogger.Log(_logFile, $"<----- Operación cancelada durante el procesamiento de {nombreConexion}.");
+                    break; // Salir del bucle foreach si se cancela el servicio
+                }
+                catch (Exception ex)
+                {
+                    FileLogger.Log(_logFile, $"<----- ERROR al procesar {nombreConexion}: {ex.Message}");
+                    FileLogger.Log(_logFile, $"StackTrace: {ex.StackTrace}");
+
+                    // Agregar información de la excepción interna si existe
+                    if (ex.InnerException != null)
+                    {
+                        FileLogger.Log(_logFile, $"Inner Exception: {ex.InnerException.Message}");
+                        FileLogger.Log(_logFile, $"Inner StackTrace: {ex.InnerException.StackTrace}");
+                    }
+                }
             }
-            else
-            {
-                FileLogger.Log(_logFile, "No se encontraron registros nuevos para transferir.");
-            }
+
+            FileLogger.Log(_logFile, "---- Ciclo de transferencia completado ----");
         }
+
         protected override void OnStop()
         {
             FileLogger.Log(_logFile, "---- Deteniendo el servicio...");
@@ -133,7 +147,6 @@ namespace WindowsServiceTestGeisha
 
             try
             {
-                // Esperamos un tiempo razonable para que la tarea termine limpiamente.
                 _mainTask?.Wait(TimeSpan.FromSeconds(15));
             }
             catch (Exception ex)
@@ -142,9 +155,8 @@ namespace WindowsServiceTestGeisha
             }
 
             _cancellationTokenSource?.Dispose();
-            FileLogger.Log(_logFile, "---- Servicio Detenido ----------------------------------------------");
         }
-
 
     }
 }
+
