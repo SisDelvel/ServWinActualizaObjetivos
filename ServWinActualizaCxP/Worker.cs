@@ -7,7 +7,7 @@ namespace ServWinActualizaCxP
         private readonly ILogger<Worker> _logger;
         private readonly RepositorioCxP _repositorio;
 
-        private const int INTERVALO_MINUTOS = 5;
+        private const int INTERVALO_MINUTOS = 15;
 
         private readonly string _logFile = Path.Combine(
             @"C:\Logs\GeishaCxP",

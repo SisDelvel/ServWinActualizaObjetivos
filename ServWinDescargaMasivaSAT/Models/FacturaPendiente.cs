@@ -9,5 +9,8 @@ namespace ServWinDescargaMasivaSAT.Models
         public int Id { get; set; }
         public string RfcEmisor { get; set; } = string.Empty;
         public decimal Monto { get; set; }
+
+        public DateTime FechaFactura { get; set; }
+
     }
 }

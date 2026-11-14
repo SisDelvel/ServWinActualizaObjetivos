@@ -1,4 +1,5 @@
 ﻿using ServWinDescargaMasivaSAT.Models;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Security.Cryptography.Xml;
@@ -19,17 +20,34 @@ namespace ServWinDescargaMasivaSAT.Services
 
         Task<ProvSolicitudSat?> ObtenerSolicitudActivaAsync();
 
-        Task<int> InsertarSolicitudAsync(string idSolicitudSat, DateTime fechaSolicitud);
+        Task<int> InsertarSolicitudAsync(string idSolicitudSat, DateTime fechaSolicitud, int idEstatus = RepositorioSatDescarga.EstatusEnProceso);
+
+        // solicitudes activas desde la fecha indicada
+        Task<List<ProvSolicitudSat>> ObtenerSolicitudesDesdeAsync(DateTime desde);
 
         Task ActualizarEstatusSolicitudAsync(int id, int idEstatus);
 
-        Task<int> InsertarFacturaSatAsync(int idSolicitud, string uuid, string rfcEmisor, string rfcReceptor, int idEstado, decimal monto, DateTime fechaFactura);
+        // inserta la cabecera del xml; si el uuid ya existe regresa su id
+        Task<int> InsertarFacturaSatAsync(int idSolicitud, string uuid, string rfcEmisor, string rfcReceptor, int idEstado, decimal monto, DateTime fechaFactura, string tipoDeComprobante, string? metodoPago);
+
+        // marca la cabecera como factura (ProvFacturasSATPUE)
+        Task<int> RegistrarFacturaPueAsync(int idFacturaSat);
+
+        // marca la cabecera como complemento (ProvFacturasSATPPD)
+        Task<int> RegistrarComplementoPpdAsync(int idFacturaSat, decimal? montoTotalPagos);
+
+        // inserta un DoctoRelacionado en ProvFacsSATPPDConciliado
+        Task InsertarDoctoRelacionadoAsync(int idProvFacturasPpd, PagoCfdi pago, DoctoRelacionadoCfdi docto);
+
+        // liga los complementos que llegaron antes que su factura
+        Task<int> ResolverFacturasDeComplementosAsync();
 
         Task ActualizarEstadoFacturaAsync(int id, int idEstado);
 
         Task<List<FacturaPendiente>> ObtenerFacturasPendientesAsync();
 
         Task<int?> ObtenerIdDocumentoPorFacturaAsync(int idFactura);
+
     }
     internal class RepositorioSatDescarga:IRepositorioSatDescarga
     {
@@ -41,15 +59,29 @@ namespace ServWinDescargaMasivaSAT.Services
         private const string ActionVerifica = "http://DescargaMasivaTerceros.sat.gob.mx/IVerificaSolicitudDescargaService/VerificaSolicitudDescarga";
         private const string ActionDescarga = "http://DescargaMasivaTerceros.sat.gob.mx/IDescargaMasivaTercerosService/Descargar";
 
-        // ── Estatus BD ────────────────────────────────────────────────────────────
+        private const string NsDescarga = "http://DescargaMasivaTerceros.sat.gob.mx";
+        private const string NsFirma = "http://www.w3.org/2000/09/xmldsig#";
+
+        // estatus de ProvSolicitudesSAT (no son los del sat)
         public const int EstatusEnProceso = 4;
         public const int EstatusTerminada = 5;
         public const int EstatusFallida = 6;
+
+        // solicitud aceptada
+        public const string CodSolicitudAceptada = "5000";
+
+        // sin comprobantes en el rango; el día cuenta como completo
+        public const string CodigoSinInformacion = "5004";
 
         public const int FacturaEstadoPendiente = 1;
         public const int FacturaNoConcilia = 2;
         public const int FacturaConcilia = 3;
         public const int FacturaConciliaMuchas = 4;
+
+        // TipoDeComprobante: I factura, P complemento, E nota de crédito
+        public const string TipoComprobanteIngreso = "I";
+        public const string TipoComprobantePago = "P";
+        public const string TipoComprobanteEgreso = "E";
 
         private readonly HttpClient _http;
         private readonly IRepositorioSatAuth _auth;
@@ -87,12 +119,12 @@ namespace ServWinDescargaMasivaSAT.Services
     "http://DescargaMasivaTerceros.sat.gob.mx",
     "SolicitaDescargaRecibidosResult", "CodEstatus");
 
-            if (codEstatus != "5000")
+            if (codEstatus != CodSolicitudAceptada)
             {
                 var mensaje = ExtraerAtributo(respuesta,
                     "http://DescargaMasivaTerceros.sat.gob.mx",
                     "SolicitaDescargaRecibidosResult", "Mensaje");
-                throw new Exception($"SAT rechazó la solicitud. CodEstatus={codEstatus}: {mensaje}");
+                throw new SatRechazoException(codEstatus, mensaje);
             }
 
 
@@ -151,7 +183,18 @@ namespace ServWinDescargaMasivaSAT.Services
                 new { Estatus = EstatusEnProceso });
         }
 
-        public async Task<int> InsertarSolicitudAsync(string idSolicitudSat, DateTime fechaSolicitud)
+        public async Task<List<ProvSolicitudSat>> ObtenerSolicitudesDesdeAsync(DateTime desde)
+        {
+            using var conn = new SqlConnection(_connectionString);
+            var result = await conn.QueryAsync<ProvSolicitudSat>(
+                @"SELECT Id, NumPeticionSat, FechaSolicitud, IdEstatusSolicitudSAT, FechaAceptacion, Estatus
+                  FROM ProvSolicitudesSAT
+                  WHERE FechaSolicitud >= @Desde AND Estatus = 1",
+                new { Desde = desde.Date });
+            return result.ToList();
+        }
+
+        public async Task<int> InsertarSolicitudAsync(string idSolicitudSat, DateTime fechaSolicitud, int idEstatus = EstatusEnProceso)
         {
             using var conn = new SqlConnection(_connectionString);
             var id = await conn.ExecuteScalarAsync<int>(
@@ -164,7 +207,7 @@ namespace ServWinDescargaMasivaSAT.Services
                 {
                     IdSolicitud = idSolicitudSat,
                     FechaSolicitud = fechaSolicitud,
-                    IdEstatus = EstatusEnProceso,
+                    IdEstatus = idEstatus,
                     FechaAceptacion = fechaSolicitud
                 });
 
@@ -179,27 +222,45 @@ namespace ServWinDescargaMasivaSAT.Services
                 @"UPDATE ProvSolicitudesSAT
           SET IdEstatusSolicitudSAT = @IdEstatus,
               FechaAceptacion = CASE WHEN @IdEstatus = @EstatusTerminada THEN @Fecha ELSE FechaAceptacion END,
-              FechaAlta = CASE WHEN FechaAlta IS NULL THEN @Fecha ELSE FechaAlta END
+              FechaRechazo = CASE WHEN @IdEstatus = @EstatusFallida THEN @Fecha ELSE FechaRechazo END,
+              FechaAlta = CASE WHEN FechaAlta IS NULL THEN @Fecha ELSE FechaAlta END,
+              FechaUltModif = @Fecha
           WHERE Id = @Id",
-                new { Id = id, IdEstatus = idEstatus, Fecha = DateTime.Now, EstatusTerminada });
+                new { Id = id, IdEstatus = idEstatus, Fecha = DateTime.Now, EstatusTerminada, EstatusFallida });
         }
 
         //BD: Facturas
 
+        // si el uuid ya existe regresa su id
         public async Task<int> InsertarFacturaSatAsync(
     int idSolicitud, string uuid, string rfcEmisor,
-    string rfcReceptor, int idEstado, decimal monto, DateTime fechaFactura)
+    string rfcReceptor, int idEstado, decimal monto, DateTime fechaFactura,
+    string tipoDeComprobante, string? metodoPago)
         {
             using var conn = new SqlConnection(_connectionString);
+
+            var idExistente = await conn.QueryFirstOrDefaultAsync<int?>(
+                "SELECT TOP 1 Id FROM ProvFacturasSAT WHERE UUID = @Uuid ORDER BY Id",
+                new { Uuid = uuid });
+
+            if (idExistente.HasValue)
+            {
+                _logger.LogInformation(
+                    "UUID={Uuid} ya estaba registrado (Id={Id}). No se reinserta.", uuid, idExistente.Value);
+                return idExistente.Value;
+            }
+
             var id = await conn.ExecuteScalarAsync<int>(
                 @"INSERT INTO ProvFacturasSAT
                 (IdSolicitudSAT, UUID, RFCEmisor, RFCReceptor,
                  IdEstadoFacturaSAT, Monto, FechaFactura, IdSucursal,
-                 EsConfirmada, FechaRecepcion, FechaUltValidacion, FechaAlta, Estatus)
+                 EsConfirmada, FechaRecepcion, FechaUltValidacion, FechaAlta, Estatus,
+                 TipoDeComprobante, MetodoPago)
               VALUES
                 (@IdSolicitud, @Uuid, @RfcEmisor, @RfcReceptor,
                  @IdEstado, @Monto, @FechaFactura, 1,
-                 0, @FechaRecepcion, @FechaRecepcion, @FechaRecepcion, 1);
+                 0, @FechaRecepcion, @FechaRecepcion, @FechaRecepcion, 1,
+                 @TipoDeComprobante, @MetodoPago);
               SELECT SCOPE_IDENTITY();",
             new
             {
@@ -210,10 +271,132 @@ namespace ServWinDescargaMasivaSAT.Services
                 IdEstado = idEstado,
                 Monto = monto,
                 FechaFactura = fechaFactura,
-                FechaRecepcion = DateTime.Now
+                FechaRecepcion = DateTime.Now,
+                TipoDeComprobante = tipoDeComprobante,
+                MetodoPago = metodoPago
             });
 
             return id;
+        }
+
+        //BD: Clasificación factura / complemento
+
+        public async Task<int> RegistrarFacturaPueAsync(int idFacturaSat) =>
+            await ClasificarAsync("ProvFacturasSATPUE", idFacturaSat);
+
+        public async Task<int> RegistrarComplementoPpdAsync(int idFacturaSat, decimal? montoTotalPagos)
+        {
+            var id = await ClasificarAsync("ProvFacturasSATPPD", idFacturaSat);
+
+            // sólo la tabla de complementos tiene este campo
+            if (montoTotalPagos.HasValue)
+            {
+                using var conn = new SqlConnection(_connectionString);
+                await conn.ExecuteAsync(
+                    @"UPDATE ProvFacturasSATPPD
+                      SET    MontoTotalPagos = @Monto,
+                             FechaUltModif   = GETDATE()
+                      WHERE  Id = @Id
+                        AND  ISNULL(MontoTotalPagos, -1) <> @Monto",
+                    new { Id = id, Monto = montoTotalPagos.Value });
+            }
+
+            return id;
+        }
+
+        // si ya estaba clasificada regresa el renglón existente
+        private async Task<int> ClasificarAsync(string tabla, int idFacturaSat)
+        {
+            using var conn = new SqlConnection(_connectionString);
+
+            var idExistente = await conn.QueryFirstOrDefaultAsync<int?>(
+                $"SELECT TOP 1 Id FROM {tabla} WHERE IdProvFacturaSAT = @IdFactura",
+                new { IdFactura = idFacturaSat });
+
+            if (idExistente.HasValue) return idExistente.Value;
+
+            return await conn.ExecuteScalarAsync<int>(
+                $@"INSERT INTO {tabla} (IdProvFacturaSAT, Estatus, FechaAlta)
+                   VALUES (@IdFactura, 1, GETDATE());
+                   SELECT SCOPE_IDENTITY();",
+                new { IdFactura = idFacturaSat });
+        }
+
+        //BD: Complementos de pago
+
+        // NOT EXISTS para no duplicar al reprocesar; sin factura, IdFacturaSAT queda NULL
+        public async Task InsertarDoctoRelacionadoAsync(
+            int idProvFacturasPpd, PagoCfdi pago, DoctoRelacionadoCfdi docto)
+        {
+            using var conn = new SqlConnection(_connectionString);
+
+            var filas = await conn.ExecuteAsync(
+                @"IF NOT EXISTS (
+                      SELECT 1 FROM ProvFacsSATPPDConciliado
+                      WHERE IdProvFacturasPPD = @IdPpd
+                        AND NumPago           = @NumPago
+                        AND UUIDRelacionada   = @Uuid
+                  )
+                  INSERT INTO ProvFacsSATPPDConciliado
+                      (IdProvFacturasPPD, NumPago, FechaPago, FormaDePagoP, NumOperacion,
+                       MonedaP, TipoCambioP, MontoPago, UUIDRelacionada, IdFacturaSAT,
+                       NoParcialidad, MontoSaldoAnterior, MontoPagado, MontoSaldoInsoluto,
+                       MonedaDR, EquivalenciaDR,
+                       EsConciliado, Estatus, FechaAlta)
+                  VALUES
+                      (@IdPpd, @NumPago, @FechaPago, @FormaDePagoP, @NumOperacion,
+                       @MonedaP, @TipoCambioP, @MontoPago, @Uuid,
+                       -- Mientras queden UUID duplicados en ProvFacturasSAT (ver
+                       -- script 02, sección 6) puede haber dos copias de la misma
+                       -- factura. Se prefiere la confirmada, que es la que tiene
+                       -- la CxP ligada; si ninguna lo está, la más antigua.
+                       (SELECT TOP 1 Id FROM ProvFacturasSAT
+                         WHERE UUID = @Uuid AND ISNULL(TipoDeComprobante, 'I') = 'I'
+                         ORDER BY EsConfirmada DESC, Id),
+                       @NoParcialidad, @MontoSaldoAnterior, @MontoPagado, @MontoSaldoInsoluto,
+                       @MonedaDR, @EquivalenciaDR,
+                       0, 1, GETDATE())",
+                new
+                {
+                    IdPpd = idProvFacturasPpd,
+                    pago.NumPago,
+                    pago.FechaPago,
+                    pago.FormaDePagoP,
+                    pago.NumOperacion,
+                    pago.MonedaP,
+                    pago.TipoCambioP,
+                    pago.MontoPago,
+                    Uuid = docto.IdDocumento,
+                    NoParcialidad = docto.NumParcialidad,
+                    MontoSaldoAnterior = docto.ImpSaldoAnt,
+                    MontoPagado = docto.ImpPagado,
+                    MontoSaldoInsoluto = docto.ImpSaldoInsoluto,
+                    docto.MonedaDR,
+                    docto.EquivalenciaDR
+                });
+
+            if (filas > 0)
+                _logger.LogInformation(
+                    "Docto relacionado registrado: PPD={IdPpd} Pago={NumPago} UUID={Uuid} Pagado={Monto}",
+                    idProvFacturasPpd, pago.NumPago, docto.IdDocumento, docto.ImpPagado);
+        }
+
+        public async Task<int> ResolverFacturasDeComplementosAsync()
+        {
+            using var conn = new SqlConnection(_connectionString);
+            return await conn.ExecuteAsync(
+                @"UPDATE c
+                  SET    c.IdFacturaSAT  = f.Id,
+                         c.FechaUltModif = GETDATE()
+                  FROM   ProvFacsSATPPDConciliado c
+                  CROSS APPLY (
+                      SELECT TOP 1 Id FROM ProvFacturasSAT
+                      WHERE UUID = c.UUIDRelacionada
+                        AND ISNULL(TipoDeComprobante, 'I') = 'I'
+                      ORDER BY EsConfirmada DESC, Id
+                  ) f
+                  WHERE  c.IdFacturaSAT IS NULL
+                    AND  c.Estatus = 1");
         }
 
         public async Task ActualizarEstadoFacturaAsync(int id, int idEstado)
@@ -233,14 +416,14 @@ namespace ServWinDescargaMasivaSAT.Services
     X509Certificate2 cert, RSA rsa, string rfc, DateTime inicio, DateTime fin)
         {
             var certB64 = Convert.ToBase64String(cert.RawData);
-            var issuer = cert.Subject;
-            var serial = cert.SerialNumber;
+            var issuer = cert.Issuer;
+            var serial = NumeroSerieLegible(cert);
             var inicioStr = inicio.ToString("yyyy-MM-ddTHH:mm:ss");
             var finStr = fin.ToString("yyyy-MM-ddTHH:mm:ss");
 
-            // 1. Corregimos EstadoComprobante="Vigente" en el nodo a firmar
+            // el nodo firmado debe declarar los mismos namespaces que el envelope (des y xd)
             var nodoXml =
-                $"<des:SolicitaDescargaRecibidos xmlns:des=\"http://DescargaMasivaTerceros.sat.gob.mx\">" +
+                $"<des:SolicitaDescargaRecibidos xmlns:des=\"{NsDescarga}\" xmlns:xd=\"{NsFirma}\">" +
                 $"<des:solicitud RfcReceptor=\"{rfc}\" FechaInicial=\"{inicioStr}\" " +
                 $"FechaFinal=\"{finStr}\" TipoSolicitud=\"CFDI\" EstadoComprobante=\"Vigente\" RfcSolicitante=\"{rfc}\"/>" +
                 $"</des:SolicitaDescargaRecibidos>";
@@ -266,11 +449,11 @@ namespace ServWinDescargaMasivaSAT.Services
             X509Certificate2 cert, RSA rsa, string rfc, string idSolicitud)
         {
             var certB64 = Convert.ToBase64String(cert.RawData);
-            var issuer = cert.Subject;
-            var serial = cert.SerialNumber;
+            var issuer = cert.Issuer;
+            var serial = NumeroSerieLegible(cert);
 
             var nodoXml =
-                $"<des:VerificaSolicitudDescarga xmlns:des=\"http://DescargaMasivaTerceros.sat.gob.mx\">" +
+                $"<des:VerificaSolicitudDescarga xmlns:des=\"{NsDescarga}\" xmlns:xd=\"{NsFirma}\">" +
                 $"<des:solicitud IdSolicitud=\"{idSolicitud}\" RfcSolicitante=\"{rfc}\"/>" +
                 $"</des:VerificaSolicitudDescarga>";
 
@@ -292,11 +475,11 @@ namespace ServWinDescargaMasivaSAT.Services
             X509Certificate2 cert, RSA rsa, string rfc, string idPaquete)
         {
             var certB64 = Convert.ToBase64String(cert.RawData);
-            var issuer = cert.Subject;
-            var serial = cert.SerialNumber;
+            var issuer = cert.Issuer;
+            var serial = NumeroSerieLegible(cert);
 
             var nodoXml =
-                $"<des:PeticionDescargaMasivaTercerosEntrada xmlns:des=\"http://DescargaMasivaTerceros.sat.gob.mx\">" +
+                $"<des:PeticionDescargaMasivaTercerosEntrada xmlns:des=\"{NsDescarga}\" xmlns:xd=\"{NsFirma}\">" +
                 $"<des:peticionDescarga IdPaquete=\"{idPaquete}\" RfcSolicitante=\"{rfc}\"/>" +
                 $"</des:PeticionDescargaMasivaTercerosEntrada>";
 
@@ -316,6 +499,23 @@ namespace ServWinDescargaMasivaSAT.Services
         }
 
         //Firma XML
+
+        // el sat espera el número de serie como texto, no en hexadecimal
+        private static string NumeroSerieLegible(X509Certificate2 cert)
+        {
+            var hex = cert.SerialNumber;
+            if (string.IsNullOrWhiteSpace(hex) || hex.Length % 2 != 0) return hex ?? string.Empty;
+
+            var bytes = new byte[hex.Length / 2];
+            for (var i = 0; i < bytes.Length; i++)
+            {
+                if (!byte.TryParse(hex.AsSpan(i * 2, 2), NumberStyles.HexNumber, null, out bytes[i]))
+                    return hex;
+            }
+
+            var texto = Encoding.ASCII.GetString(bytes);
+            return texto.All(char.IsDigit) ? texto : hex;
+        }
 
         private static (string DigestValue, string SignatureValue) FirmarNodo(string nodoXml, RSA rsa)
         {
@@ -355,15 +555,24 @@ namespace ServWinDescargaMasivaSAT.Services
             "</X509Data></KeyInfo>" +
             "</Signature>";
 
-        //Reintento 
+        //Reintento
+
+        // facturas sin conciliar; se excluyen los complementos (tipo P)
         public async Task<List<FacturaPendiente>> ObtenerFacturasPendientesAsync()
         {
             using var conn = new SqlConnection(_connectionString);
             var result = await conn.QueryAsync<FacturaPendiente>(
-                @"SELECT Id, RFCEmisor, Monto
+                @"SELECT Id, RFCEmisor, Monto, FechaFactura
           FROM ProvFacturasSAT
-          WHERE IdEstadoFacturaSAT = @Estatus AND Estatus = 1",
-                new { Estatus = FacturaEstadoPendiente });  
+          WHERE IdEstadoFacturaSAT IN (@Pendiente, @NoConcilia)
+            AND Estatus = 1
+            AND ISNULL(TipoDeComprobante, @TipoIngreso) = @TipoIngreso",
+                new
+                {
+                    Pendiente = FacturaEstadoPendiente,
+                    NoConcilia = FacturaNoConcilia,
+                    TipoIngreso = TipoComprobanteIngreso
+                });
             return result.ToList();
         }
 
@@ -372,20 +581,20 @@ namespace ServWinDescargaMasivaSAT.Services
             using var conn = new SqlConnection(_connectionString);
             return await conn.QueryFirstOrDefaultAsync<int?>(
                 @"SELECT Id FROM OperDocumentosXTipo
-          WHERE IdTiposOper = 1
-            AND IdTiposDocumentoOper = 1
-            AND Estatus = 1
-            AND Id IN (
-                SELECT IdOperDocumentosXTipo 
-                FROM OperDocumentosXTipoProvCXP 
-                WHERE IdProvCXP IN (
-                    SELECT Id FROM ProvCXP WHERE IdProveedor IN (
-                        SELECT pv.Id FROM PersProveedores pv
-                        INNER JOIN PersPersonas pp ON pp.Id = pv.IdPersPersona
-                        INNER JOIN ProvFacturasSAT f ON f.RFCReceptor = pp.Rfc
-                        WHERE f.Id = @IdFactura
+                WHERE IdTiposOper = 1
+                  AND IdTiposDocumentoOper = 1
+                  AND Estatus = 1
+                  AND Id IN (
+                      SELECT r.IdOperDocumentosXTipo
+                      FROM OperDocumentosXTipoProvCXP r
+                      INNER JOIN ProvCalendarioPagos cal ON cal.Id = r.IdProvCalendarioPagos
+                      INNER JOIN ProvCXP cxp ON cxp.Id = cal.IdProvCxP
+                      WHERE cxp.IdProveedor IN (
+                          SELECT pv.Id FROM PersProveedores pv
+                          INNER JOIN PersPersonas pp ON pp.Id = pv.IdPersPersona
+                          INNER JOIN ProvFacturasSAT f ON f.RFCReceptor = pp.Rfc
+                          WHERE f.Id = @IdFactura
                     )
-                )
             )",
                 new { IdFactura = idFactura });
         }
@@ -482,6 +691,7 @@ namespace ServWinDescargaMasivaSAT.Services
             if (int.TryParse(nodo.Attributes?["EstadoSolicitud"]?.Value, out var estatus))
                 resultado.Estatus = (EstatusSolicitudSat)estatus;
 
+            resultado.CodigoEstadoSolicitud = nodo.Attributes?["CodigoEstadoSolicitud"]?.Value ?? string.Empty;
             resultado.MensajeSat = nodo.Attributes?["Mensaje"]?.Value ?? string.Empty;
 
             var nodosPaquetes = doc.SelectNodes("//des:IdsPaquetes", mgr);
@@ -491,5 +701,6 @@ namespace ServWinDescargaMasivaSAT.Services
 
             return resultado;
         }
+
     }
 }

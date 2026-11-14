@@ -13,11 +13,16 @@ namespace ServWinDescargaMasivaSAT.Services
         Task<List<ProvCxp>> BuscarCxpPorProveedorYMontoAsync(int idProveedor, decimal total);
         Task InsertarDocumentoProvCxpAsync(int idDocumento, int idCalendarioPagos);
         Task<int?> ObtenerOCrearCalendarioPagoAsync(int idProvCxp, decimal importe, DateTime fechaFactura);
+
+        // registra la cxp como candidata; la confirmación es manual
+        Task InsertarCandidatoConciliacionAsync(int idFacturaSat, int idCxp, decimal valorCxp, decimal valorFacturaSat);
     }
-    public class RepositorioCxP:IRepositorioCxP
+    public class RepositorioCxP : IRepositorioCxP
     {
         private readonly string _connectionString;
         private readonly ILogger<RepositorioCxP> _logger;
+
+        private const int ID_USUARIO_SISTEMA = 1;
 
         public RepositorioCxP(IConfiguration config, ILogger<RepositorioCxP> logger)
         {
@@ -46,12 +51,23 @@ namespace ServWinDescargaMasivaSAT.Services
         {
             using var conn = new SqlConnection(_connectionString);
             var resultados = await conn.QueryAsync<ProvCxp>(
-                @"SELECT Id, IdProveedor, ImporteTotal, IdSucursal, CxPEstado
-                  FROM ProvCXP
-                  WHERE IdProveedor  = @IdProveedor
-                    AND ImporteTotal = @Total
-                    AND CxPEstado    = 'P'
-                    AND Estatus      = 1",
+                @"SELECT c.Id, c.IdProveedor, c.ImporteTotal, c.IdSucursal, c.CxPEstado
+                  FROM ProvCXP c
+                  WHERE c.IdProveedor  = @IdProveedor
+                    AND c.ImporteTotal = @Total
+                    AND c.CxPEstado    = 'P'
+                    AND c.Estatus      = 1
+                    -- No proponer una CxP que ya está confirmada como conciliada
+                    -- con otra factura. Una candidatura sin confirmar sí puede
+                    -- seguir compitiendo (caso 'concilia muchas'), pero una vez
+                    -- confirmada queda cerrada para cualquier otra factura.
+                    AND NOT EXISTS (
+                        SELECT 1 FROM ProvFacturasConciliacionSAT pfc
+                        INNER JOIN ProvFacturasSAT fs ON fs.Id = pfc.IdFacturaSAT
+                        WHERE pfc.IdCxP = c.Id
+                          AND fs.EsConfirmada = 1
+                          AND fs.Estatus = 1
+                    )",
                 new { IdProveedor = idProveedor, Total = total });
 
             return resultados.ToList();
@@ -118,6 +134,41 @@ namespace ServWinDescargaMasivaSAT.Services
 
             return idCalendario;
         }
+
+        public async Task InsertarCandidatoConciliacionAsync(
+            int idFacturaSat, int idCxp, decimal valorCxp, decimal valorFacturaSat)
+        {
+            using var conn = new SqlConnection(_connectionString);
+
+            // NOT EXISTS para no duplicar el candidato en reintentos
+            var filasAfectadas = await conn.ExecuteAsync(
+                @"IF NOT EXISTS (
+                      SELECT 1 FROM ProvFacturasConciliacionSAT
+                      WHERE IdFacturaSAT = @IdFacturaSat
+                        AND IdCxP        = @IdCxp
+                        AND Estatus      = 1
+                  )
+                  INSERT INTO ProvFacturasConciliacionSAT
+                      (FechaConciliacion, IdFacturaSAT, IdCxP, CampoNoValido,
+                       ValorCxP, ValorFacturaSAT, Estatus, IdUsuarioAlta, FechaAlta)
+                  VALUES
+                      (GETDATE(), @IdFacturaSat, @IdCxp, @CampoNoValido,
+                       @ValorCxp, @ValorFacturaSat, 1, @IdUsuarioSistema, GETDATE())",
+                new
+                {
+                    IdFacturaSat = idFacturaSat,
+                    IdCxp = idCxp,
+                    ValorCxp = valorCxp,
+                    ValorFacturaSat = valorFacturaSat,
+                    // CampoNoValido no admite NULL
+                    CampoNoValido = string.Empty,
+                    IdUsuarioSistema = ID_USUARIO_SISTEMA
+                });
+
+            if (filasAfectadas > 0)
+                _logger.LogInformation(
+                    "Candidato de conciliación registrado: Factura={IdFactura} CxP={IdCxp}",
+                    idFacturaSat, idCxp);
+        }
     }
 }
-

@@ -13,11 +13,18 @@ namespace ServWinDescargaMasivaSAT.Services
 {
     public interface IRepositorioSharePoint
     {
-        Task<(int IdDocumento, string UniqueId, string Url)> SubirXmlAsync(byte[] contenido, string nombreArchivo, DateTime fecha, CancellationToken ct = default);
+        Task<(int IdDocumento, string UniqueId, string Url)> SubirXmlAsync(byte[] contenido, string nombreArchivo, DateTime fecha, int idTipoDocumento = TiposDocumentoOper.FacturaXml, CancellationToken ct = default);
     }
+
+    // ComuCatTiposDocumentoOper, mismos ids que la api
+    public static class TiposDocumentoOper
+    {
+        public const int FacturaXml = 1;
+        public const int ComplementoXml = 3;
+    }
+
     internal class RepositorioSharePoint:IRepositorioSharePoint
     {
-        private const int TipoDocumentoFacturaXml = 1;
         private const int TipoOperCxp = 1;
 
         private readonly HttpClient _http;
@@ -41,7 +48,8 @@ namespace ServWinDescargaMasivaSAT.Services
         }
 
         public async Task<(int IdDocumento, string UniqueId, string Url)> SubirXmlAsync(
-            byte[] contenido, string nombreArchivo, DateTime fecha, CancellationToken ct = default)
+            byte[] contenido, string nombreArchivo, DateTime fecha,
+            int idTipoDocumento = TiposDocumentoOper.FacturaXml, CancellationToken ct = default)
         {
             var token = await ObtenerTokenAsync(ct);
 
@@ -76,7 +84,7 @@ namespace ServWinDescargaMasivaSAT.Services
             _logger.LogInformation("Archivo subido. UniqueId={UniqueId}", uniqueId);
 
             var idDocumento = await InsertarDocumentoAsync(
-                nombreArchivo, downloadUrl, uniqueId, "application/xml", contenido.Length);
+                nombreArchivo, downloadUrl, uniqueId, "application/xml", contenido.Length, idTipoDocumento);
 
             return (idDocumento, uniqueId, downloadUrl);
         }
@@ -84,9 +92,32 @@ namespace ServWinDescargaMasivaSAT.Services
         //BD
 
         private async Task<int> InsertarDocumentoAsync(
-            string archivo, string url, string idSharePoint, string mimeType, long tamano)
+            string archivo, string url, string idSharePoint, string mimeType, long tamano,
+            int idTipoDocumento)
         {
             using var conn = new SqlConnection(_connectionString);
+
+            // si el renglón ya existe se reusa
+            var idExistente = await conn.QueryFirstOrDefaultAsync<int?>(
+                @"SELECT TOP 1 Id FROM OperDocumentosXTipo
+                  WHERE Archivo = @Archivo
+                    AND IdTiposDocumentoOper = @IdTipoDoc
+                    AND Estatus = 1
+                  ORDER BY Id",
+                new { Archivo = archivo, IdTipoDoc = idTipoDocumento });
+
+            if (idExistente.HasValue)
+            {
+                await conn.ExecuteAsync(
+                    @"UPDATE OperDocumentosXTipo
+                      SET    Url = @Url, IdSharePoint = @IdSharePoint, Tmano = @Tamano
+                      WHERE  Id = @Id",
+                    new { Id = idExistente.Value, Url = url, IdSharePoint = idSharePoint, Tamano = tamano });
+
+                _logger.LogInformation("Documento {Archivo} ya estaba registrado (Id={Id}).", archivo, idExistente.Value);
+                return idExistente.Value;
+            }
+
             var id = await conn.ExecuteScalarAsync<int>(
             @"INSERT INTO OperDocumentosXTipo
                 (IdTiposDocumentoOper, IdTiposOper, Archivo, Url,
@@ -97,7 +128,7 @@ namespace ServWinDescargaMasivaSAT.Services
               SELECT SCOPE_IDENTITY();",
             new
             {
-                IdTipoDoc = TipoDocumentoFacturaXml,
+                IdTipoDoc = idTipoDocumento,
                 IdTipoOper = TipoOperCxp,
                 Archivo = archivo,
                 Url = url,
